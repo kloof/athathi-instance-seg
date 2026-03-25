@@ -1,0 +1,40 @@
+data:
+  pointcept_root: "data/structured3d_pointcept"
+  processed_root: "data/processed_3m"
+  block_size: 3.0
+  num_points: 16384
+  wall_label_id: 1
+  min_points_per_block: 500
+  voxel_size: 0.03
+
+model:
+  input_dim: 10
+  num_classes: 2
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  epochs: 1
+  weight_decay: 0.0001
+  wall_class_weight: 1.5
+  scheduler: "cosine"
+  num_workers: 0
+  eval_every: 1
+  save_every: 1
+
+augmentation:
+  enabled: true
+  densify: false
+  noise_min: 0.005
+  noise_max: 0.020
+  dropout_keep: 0.85
+  random_rotation_z: true
+
+export:
+  onnx_path: "checkpoints/pointnet_wall.onnx"
+  quantized_path: "checkpoints/pointnet_wall_int8.onnx"
+
+inference:
+  voxel_size: 0.03
+  block_size: 1.0
+  num_points: 4096
