@@ -13,13 +13,13 @@ model:
 training:
   batch_size: 32
   learning_rate: 0.001
-  epochs: 100
+  epochs: 20
   weight_decay: 0.0001
   wall_class_weight: 1.5
   scheduler: "cosine"
   num_workers: 0
-  eval_every: 10
-  save_every: 10
+  eval_every: 5
+  save_every: 5
 
 augmentation:
   enabled: true

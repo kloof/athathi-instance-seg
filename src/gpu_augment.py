@@ -15,74 +15,125 @@ def densify_batch_gpu(
     points: torch.Tensor,
     labels: torch.Tensor,
     target_multiplier: int = 6,
-    max_dist: float = 0.08,
-    K: int = 16,
+    max_dist: float = 0.30,
+    K: int = 12,
+    keep_all: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Densify point clouds via random-neighbor interpolation on GPU.
+    """Densify point clouds via torch_cluster KNN interpolation on GPU.
 
-    Fast O(B*N*K) approach: for each point, samples K random other points,
-    picks the nearest same-label one within max_dist, and interpolates.
-    No N×N distance matrix — constant memory, fully vectorized.
+    For each point, finds K true nearest neighbors via CUDA KNN,
+    picks a random same-label neighbor within max_dist, and interpolates.
 
     Args:
         points: (B, N, 3) float32 on GPU.
         labels: (B, N) int64 on GPU.
-        target_multiplier: densification factor (default 6x).
+        target_multiplier: density factor (default 6x).
         max_dist: max distance for interpolation pairs (meters).
-        K: random candidates to sample per point.
+        K: number of KNN neighbors.
+        keep_all: if True, return all N*factor points.
 
     Returns:
-        (B, N, 3), (B, N) — densified then subsampled back to N.
+        keep_all=False: (B, N, 3), (B, N)
+        keep_all=True:  (B, N*factor, 3), (B, N*factor)
     """
+    from torch_cluster import knn as tc_knn
+
     B, N, _ = points.shape
     device = points.device
     new_rounds = target_multiplier - 1
+
+    if new_rounds <= 0:
+        return points, labels
+
+    # Run torch_cluster KNN once (CUDA optimized)
+    pts_flat = points.reshape(B * N, 3)
+    batch_vec = torch.arange(B, device=device).repeat_interleave(N)
+    edge_index = tc_knn(pts_flat, pts_flat, K + 1, batch_vec, batch_vec)  # +1 for self
+
+    # Reshape to (B, N, K+1) and remove self-neighbor
+    knn_idx = edge_index[1].reshape(B, N, K + 1)
+    knn_idx = knn_idx[:, :, 1:]  # skip self (index 0), keep K neighbors
+    # Convert global to per-sample indices
+    offsets = torch.arange(B, device=device).unsqueeze(1).unsqueeze(2) * N
+    knn_idx = knn_idx - offsets  # (B, N, K)
+
+    # Gather neighbor points and labels
+    knn_pts = torch.gather(
+        points, 1,
+        knn_idx.reshape(B, N * K).unsqueeze(2).expand(-1, -1, 3)
+    ).reshape(B, N, K, 3)
+    knn_lbl = torch.gather(
+        labels, 1,
+        knn_idx.reshape(B, N * K)
+    ).reshape(B, N, K)
+
+    # Distances to neighbors
+    knn_dists = (knn_pts - points.unsqueeze(2)).norm(dim=3)  # (B, N, K)
+
+    # Mask: same label + within max_dist
+    valid = (knn_lbl == labels.unsqueeze(2)) & (knn_dists < max_dist) & (knn_dists > 1e-6)
+
+    has_any_valid = valid.any(dim=2)  # (B, N)
+    has_two_valid = valid.sum(dim=2) >= 2  # (B, N) — at least 2 valid neighbors
 
     all_new_pts = [points]
     all_new_lbl = [labels]
 
     for _ in range(new_rounds):
-        # Sample K random candidate indices per point: (B, N, K)
-        cand_idx = torch.randint(N, (B, N, K), device=device)
+        # Pick two different random valid neighbors
+        rand1 = torch.rand(B, N, K, device=device)
+        rand1 = torch.where(valid, rand1, torch.full_like(rand1, -1.0))
+        k1 = rand1.argmax(dim=2)  # (B, N)
 
-        # Gather candidate points: (B, N*K, 3) then reshape
-        flat_idx = cand_idx.reshape(B, N * K)
-        cand_pts = torch.gather(
-            points, 1, flat_idx.unsqueeze(2).expand(-1, -1, 3)
-        ).reshape(B, N, K, 3)
+        rand2 = torch.rand(B, N, K, device=device)
+        rand2 = torch.where(valid, rand2, torch.full_like(rand2, -1.0))
+        # Make sure k2 != k1 by zeroing out k1's position
+        rand2.scatter_(2, k1.unsqueeze(2), -1.0)
+        k2 = rand2.argmax(dim=2)  # (B, N)
 
-        # Gather candidate labels: (B, N*K) then reshape
-        cand_lbl = torch.gather(labels, 1, flat_idx).reshape(B, N, K)
+        idx1 = torch.gather(knn_idx, 2, k1.unsqueeze(2)).squeeze(2)
+        idx2 = torch.gather(knn_idx, 2, k2.unsqueeze(2)).squeeze(2)
+        nb1 = torch.gather(points, 1, idx1.unsqueeze(2).expand(-1, -1, 3))
+        nb2 = torch.gather(points, 1, idx2.unsqueeze(2).expand(-1, -1, 3))
 
-        # Distances to candidates: (B, N, K)
-        cand_dists = torch.norm(cand_pts - points.unsqueeze(2), dim=3)
+        # Barycentric interpolation between (point, neighbor1, neighbor2)
+        # Random weights that sum to 1
+        w = torch.rand(B, N, 3, device=device)
+        w = w / w.sum(dim=2, keepdim=True)
 
-        # Valid: same label, within max_dist, not self
-        valid = (cand_lbl == labels.unsqueeze(2)) & (cand_dists < max_dist) & (cand_dists > 1e-6)
+        new_pts = (
+            points * w[:, :, 0:1] +
+            nb1 * w[:, :, 1:2] +
+            nb2 * w[:, :, 2:3]
+        )
 
-        # Pick nearest valid candidate
-        cand_dists_masked = torch.where(valid, cand_dists, torch.full_like(cand_dists, float("inf")))
-        best_k = cand_dists_masked.argmin(dim=2)  # (B, N)
+        # If only 1 valid neighbor, do regular 2-point interpolation
+        t = torch.rand(B, N, 1, device=device) * 0.8 + 0.1
+        two_pt = points * (1 - t) + nb1 * t
 
-        best_idx = torch.gather(cand_idx, 2, best_k.unsqueeze(2)).squeeze(2)
-        best_dist = torch.gather(cand_dists, 2, best_k.unsqueeze(2)).squeeze(2)
-        neighbor_pts = torch.gather(points, 1, best_idx.unsqueeze(2).expand(-1, -1, 3))
+        new_pts = torch.where(
+            has_two_valid.unsqueeze(2).expand(-1, -1, 3),
+            new_pts,
+            two_pt,
+        )
 
-        # Interpolate [0.2, 0.8]
-        t = torch.rand(B, N, 1, device=device) * 0.6 + 0.2
-        new_pts = points * (1 - t) + neighbor_pts * t
-
-        # Invalid -> duplicate original
-        has_valid = (best_dist < max_dist).unsqueeze(2).expand(-1, -1, 3)
-        new_pts = torch.where(has_valid, new_pts, points)
+        # No valid neighbor at all: tiny jitter
+        new_pts = torch.where(
+            has_any_valid.unsqueeze(2).expand(-1, -1, 3),
+            new_pts,
+            points + torch.randn_like(points) * 0.001,
+        )
 
         all_new_pts.append(new_pts)
         all_new_lbl.append(labels)
 
-    # Concatenate then subsample back to N
     dense_pts = torch.cat(all_new_pts, dim=1)
     dense_lbl = torch.cat(all_new_lbl, dim=1)
 
+    if keep_all:
+        return dense_pts, dense_lbl
+
+    # Subsample back to N
     N_dense = dense_pts.shape[1]
     perm = torch.stack([torch.randperm(N_dense, device=device) for _ in range(B)])
     idx = perm[:, :N]

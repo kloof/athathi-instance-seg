@@ -1,12 +1,26 @@
-"""Point cloud segmentation models: PointNet, DGCNN, RandLA-Net."""
+"""Point cloud segmentation models: PointNet, DGCNN, RandLA-Net, PTv2-lite."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+
+_USE_TORCH_CLUSTER = True  # Set False for ONNX export
+
+try:
+    from torch_cluster import knn as _tc_knn
+except ImportError:
+    _tc_knn = None
+
+# Cache for batch index tensors: (B, N, device) -> tensor
+_batch_cache: dict[tuple, torch.Tensor] = {}
+_offset_cache: dict[tuple, torch.Tensor] = {}
 
 
 def knn(x: torch.Tensor, k: int) -> torch.Tensor:
-    """Find k nearest neighbors for each point using pairwise distances.
+    """Find k nearest neighbors. Uses torch_cluster when available (CUDA fast),
+    falls back to brute-force for ONNX export or CPU.
 
     Args:
         x: (B, C, N) point features.
@@ -15,11 +29,28 @@ def knn(x: torch.Tensor, k: int) -> torch.Tensor:
     Returns:
         (B, N, k) indices of k nearest neighbors.
     """
-    # Pairwise distance: (B, N, N)
-    inner = -2 * torch.bmm(x.transpose(2, 1), x)          # (B, N, N)
-    xx = torch.sum(x ** 2, dim=1, keepdim=True)            # (B, 1, N)
-    dist = -xx - inner - xx.transpose(2, 1)                # (B, N, N) negative distances
-    _, idx = dist.topk(k=k, dim=-1)                        # (B, N, k) largest = nearest
+    B, C, N = x.shape
+    if _USE_TORCH_CLUSTER and _tc_knn is not None and not torch.jit.is_tracing():
+        x_flat = x.permute(0, 2, 1).reshape(B * N, C)
+
+        # Cache batch/offset tensors — same shape reuses the same tensor
+        cache_key = (B, N, x.device)
+        if cache_key not in _batch_cache:
+            _batch_cache[cache_key] = torch.arange(B, device=x.device).repeat_interleave(N)
+            _offset_cache[cache_key] = (torch.arange(B, device=x.device) * N).unsqueeze(1).unsqueeze(2)
+        batch = _batch_cache[cache_key]
+        offsets = _offset_cache[cache_key]
+
+        edge_index = _tc_knn(x_flat, x_flat, k, batch, batch)
+        idx = edge_index[0].reshape(B, N, k)
+        idx = idx - offsets
+        return idx
+
+    # Brute-force fallback (ONNX export / CPU / no torch_cluster)
+    # torch.cdist is fused and avoids materializing the full N×N intermediate
+    pts = x.transpose(2, 1)  # (B, N, C)
+    dists = torch.cdist(pts, pts)  # (B, N, N)
+    _, idx = dists.topk(k=k, dim=-1, largest=False)
     return idx
 
 
@@ -267,30 +298,8 @@ class LocalFeatureAggregation(nn.Module):
         return gathered.reshape(B, C, N, K)
 
     def _random_knn(self, x):
-        """Approximate KNN via random candidate sampling. O(N*K) not O(N²).
-        x: (B, C, N) -> idx: (B, N, K)"""
-        B, C, N = x.shape
-        K = self.K
-        # Sample K*4 random candidates, pick K nearest
-        n_cand = min(K * 4, N)
-        cand_idx = torch.randint(N, (B, N, n_cand), device=x.device)
-
-        # Gather candidate features
-        x_t = x.permute(0, 2, 1)  # (B, N, C)
-        src = x_t.unsqueeze(2).expand(-1, -1, n_cand, -1)  # (B, N, n_cand, C)
-        cand_pts = torch.gather(
-            x_t.unsqueeze(1).expand(-1, N, -1, -1),
-            2,
-            cand_idx.unsqueeze(3).expand(-1, -1, -1, C),
-        )  # (B, N, n_cand, C)
-
-        # Distances
-        dists = torch.norm(src - cand_pts, dim=3)  # (B, N, n_cand)
-
-        # Top-K nearest from candidates
-        _, topk = dists.topk(K, dim=2, largest=False)  # (B, N, K)
-        idx = torch.gather(cand_idx, 2, topk)  # (B, N, K)
-        return idx
+        """KNN using torch_cluster (CUDA optimized). x: (B, C, N) -> idx: (B, N, K)"""
+        return knn(x, self.K)
 
     def forward(self, x):
         """x: (B, C, N) -> (B, out_ch, N)"""
@@ -344,11 +353,15 @@ class RandLANetSegmentation(nn.Module):
         )
 
     def _random_downsample(self, x, ratio=4):
-        """Randomly downsample points. x: (B, C, N) -> (B, C, N//ratio), idx"""
+        """Downsample points. Uses stride for ONNX compat, random during training."""
         B, C, N = x.shape
         n_keep = max(N // ratio, 1)
-        idx = torch.stack([torch.randperm(N, device=x.device)[:n_keep] for _ in range(B)])
-        idx_sorted, _ = idx.sort(dim=1)
+        if self.training:
+            idx = torch.stack([torch.randperm(N, device=x.device)[:n_keep] for _ in range(B)])
+            idx_sorted, _ = idx.sort(dim=1)
+        else:
+            # Fixed stride — ONNX exportable
+            idx_sorted = torch.arange(0, N, ratio, device=x.device)[:n_keep].unsqueeze(0).expand(B, -1)
         down = torch.gather(x, 2, idx_sorted.unsqueeze(1).expand(-1, C, -1))
         return down, idx_sorted
 
@@ -391,4 +404,253 @@ class RandLANetSegmentation(nn.Module):
         u0 = self.dec1(u0)                              # (B, 32, N)
 
         logits = self.classifier(u0)                    # (B, num_classes, N)
+        return logits
+
+
+# ============================================================
+# PTv2-lite — Point Transformer V2 inspired, dense batched ops
+# ============================================================
+# Grouped Vector Attention on (B, C, N) tensors.
+# No pointops/torch_geometric/torch_scatter needed.
+# ONNX exportable. Uses our existing knn() for neighbor queries.
+
+
+class GroupedVectorAttention(nn.Module):
+    """Grouped Vector Attention from Point Transformer V2.
+
+    For each point, attends to K neighbors using per-group attention weights.
+    Middle ground between scalar attention (weak) and full vector attention (expensive).
+    """
+
+    def __init__(self, channels: int, num_groups: int = 8, K: int = 16):
+        super().__init__()
+        self.channels = channels
+        self.num_groups = num_groups
+        self.group_dim = channels // num_groups
+        self.K = K
+
+        self.proj_q = nn.Sequential(nn.Conv1d(channels, channels, 1, bias=False), nn.BatchNorm1d(channels), nn.ReLU(True))
+        self.proj_k = nn.Sequential(nn.Conv1d(channels, channels, 1, bias=False), nn.BatchNorm1d(channels), nn.ReLU(True))
+        self.proj_v = nn.Conv1d(channels, channels, 1, bias=False)
+
+        # Position encoding: relative xyz -> channels
+        self.pe_mlp = nn.Sequential(
+            nn.Conv2d(3, channels, 1, bias=False), nn.BatchNorm2d(channels), nn.ReLU(True),
+            nn.Conv2d(channels, channels, 1, bias=False),
+        )
+
+        # Weight encoding: channels -> num_groups (attention weights per group)
+        self.weight_enc = nn.Sequential(
+            nn.Conv2d(channels, num_groups, 1, bias=False), nn.BatchNorm2d(num_groups), nn.ReLU(True),
+            nn.Conv2d(num_groups, num_groups, 1, bias=False),
+        )
+
+        self.proj_out = nn.Sequential(nn.Conv1d(channels, channels, 1, bias=False), nn.BatchNorm1d(channels))
+
+    def _fast_knn(self, xyz, K):
+        """KNN using torch_cluster (CUDA optimized). xyz: (B, 3, N) -> idx: (B, N, K)"""
+        return knn(xyz, K)
+
+    def forward(self, x, xyz):
+        """x: (B, C, N), xyz: (B, 3, N) -> (B, C, N)"""
+        B, C, N = x.shape
+        G = self.num_groups
+        D = self.group_dim
+        K = min(self.K, N)
+
+        # Fast approximate KNN on xyz
+        knn_idx = self._fast_knn(xyz, K)  # (B, N, K)
+
+        # Project Q, K, V
+        q = self.proj_q(x)  # (B, C, N)
+        k = self.proj_k(x)  # (B, C, N)
+        v = self.proj_v(x)  # (B, C, N)
+
+        # Gather K neighbor keys and values
+        idx_flat = knn_idx.reshape(B, -1)  # (B, N*K)
+        k_neighbors = torch.gather(k, 2, idx_flat.unsqueeze(1).expand(-1, C, -1)).reshape(B, C, N, K)
+        v_neighbors = torch.gather(v, 2, idx_flat.unsqueeze(1).expand(-1, C, -1)).reshape(B, C, N, K)
+
+        # Relation: key_neighbors - query
+        relation = k_neighbors - q.unsqueeze(3)  # (B, C, N, K)
+
+        # Position encoding from relative xyz
+        xyz_neighbors = torch.gather(xyz, 2, idx_flat.unsqueeze(1).expand(-1, 3, -1)).reshape(B, 3, N, K)
+        rel_pos = xyz_neighbors - xyz.unsqueeze(3)  # (B, 3, N, K)
+        pe = self.pe_mlp(rel_pos)  # (B, C, N, K)
+
+        # Add position bias to relation and value
+        relation = relation + pe
+        v_neighbors = v_neighbors + pe
+
+        # Weight encoding: (B, C, N, K) -> (B, G, N, K) -> softmax over K
+        weights = self.weight_enc(relation)  # (B, G, N, K)
+        weights = F.softmax(weights, dim=-1)  # (B, G, N, K)
+
+        # Grouped aggregation
+        # v_neighbors: (B, C, N, K) -> (B, G, D, N, K)
+        v_grouped = v_neighbors.reshape(B, G, D, N, K)
+        # weights: (B, G, N, K) -> (B, G, 1, N, K)
+        w = weights.unsqueeze(2)
+        # Weighted sum over K: (B, G, D, N)
+        out = (v_grouped * w).sum(dim=-1)  # (B, G, D, N)
+        out = out.reshape(B, C, N)
+
+        return self.proj_out(out)
+
+
+class PTv2Block(nn.Module):
+    """Single PTv2 encoder block: GVA + FFN with residual."""
+
+    def __init__(self, channels: int, num_groups: int = 8, K: int = 16, drop_path: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.BatchNorm1d(channels)
+        self.attn = GroupedVectorAttention(channels, num_groups, K)
+        self.norm2 = nn.BatchNorm1d(channels)
+        self.ffn = nn.Sequential(
+            nn.Conv1d(channels, channels * 2, 1, bias=False),
+            nn.BatchNorm1d(channels * 2),
+            nn.GELU(),
+            nn.Conv1d(channels * 2, channels, 1, bias=False),
+        )
+        self.drop_path = drop_path
+
+    def forward(self, x, xyz):
+        # Pre-norm + attention + residual
+        shortcut = x
+        x = self.norm1(x)
+        x = shortcut + self.attn(x, xyz)
+
+        # Pre-norm + FFN + residual
+        shortcut = x
+        x = self.norm2(x)
+        x = shortcut + self.ffn(x)
+        return x
+
+
+class PTv2GridPool(nn.Module):
+    """Grid-based pooling: downsample by grouping points into grid cells."""
+
+    def __init__(self, in_ch: int, out_ch: int, ratio: int = 4):
+        super().__init__()
+        self.ratio = ratio
+        self.proj = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(True),
+        )
+
+    def forward(self, x, xyz):
+        """Downsample by random sampling (simple, ONNX-friendly).
+        Returns (x_down, xyz_down, upsample_idx)."""
+        B, C, N = x.shape
+        x = self.proj(x)
+        C_new = x.shape[1]
+        n_keep = max(N // self.ratio, 1)
+
+        # Random subsample
+        idx = torch.stack([torch.randperm(N, device=x.device)[:n_keep] for _ in range(B)])
+        idx_sorted, _ = idx.sort(dim=1)
+
+        x_down = torch.gather(x, 2, idx_sorted.unsqueeze(1).expand(-1, C_new, -1))
+        xyz_down = torch.gather(xyz, 2, idx_sorted.unsqueeze(1).expand(-1, 3, -1))
+
+        return x_down, xyz_down, idx_sorted
+
+
+class PTv2LiteSegmentation(nn.Module):
+    """Point Transformer V2 — lightweight dense-batched variant.
+
+    Grouped Vector Attention in a U-Net encoder-decoder.
+    No sparse ops, no external dependencies, ONNX exportable.
+
+    Input:  (B, input_dim, N) -- channels first
+    Output: (B, num_classes, N) -- per-point logits
+    """
+
+    def __init__(self, input_dim: int = 10, num_classes: int = 2, K: int = 16):
+        super().__init__()
+        # Lightweight config: ~3-4M params
+        enc_dims = [48, 96, 192, 256]
+        enc_groups = [6, 12, 24, 32]
+        enc_depths = [1, 1, 3, 1]
+        dec_dims = [192, 96, 48]
+
+        # Patch embedding
+        self.patch_embed = nn.Sequential(
+            nn.Conv1d(input_dim, enc_dims[0], 1, bias=False),
+            nn.BatchNorm1d(enc_dims[0]),
+            nn.ReLU(True),
+        )
+
+        # Encoder stages
+        self.enc_blocks = nn.ModuleList()
+        self.enc_pools = nn.ModuleList()
+        for i in range(4):
+            blocks = nn.ModuleList([
+                PTv2Block(enc_dims[i], enc_groups[i], K) for _ in range(enc_depths[i])
+            ])
+            self.enc_blocks.append(blocks)
+            if i < 3:  # no pool after last stage
+                self.enc_pools.append(PTv2GridPool(enc_dims[i], enc_dims[i + 1], ratio=4))
+
+        # Decoder stages (3 upsample steps)
+        self.dec_projs = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        for i in range(3):
+            in_ch = enc_dims[3 - i] + enc_dims[2 - i]  # skip + upsampled
+            self.dec_projs.append(nn.Sequential(
+                nn.Conv1d(in_ch, dec_dims[i], 1, bias=False),
+                nn.BatchNorm1d(dec_dims[i]),
+                nn.ReLU(True),
+            ))
+            self.dec_blocks.append(PTv2Block(dec_dims[i], dec_dims[i] // 8 or 1, K))
+
+        # Segmentation head
+        self.seg_head = nn.Sequential(
+            nn.Conv1d(dec_dims[-1], dec_dims[-1], 1, bias=False),
+            nn.BatchNorm1d(dec_dims[-1]),
+            nn.ReLU(True),
+            nn.Dropout(0.3),
+            nn.Conv1d(dec_dims[-1], num_classes, 1),
+        )
+
+    def _upsample(self, x_low, N_high):
+        """Nearest-neighbor upsample by repeating."""
+        B, C, N_low = x_low.shape
+        idx = torch.arange(N_high, device=x_low.device).unsqueeze(0).expand(B, -1)
+        idx = (idx * N_low // N_high).clamp(0, N_low - 1)
+        return torch.gather(x_low, 2, idx.unsqueeze(1).expand(-1, C, -1))
+
+    def forward(self, x):
+        B, _, N = x.shape
+        xyz = x[:, :3, :]  # First 3 channels are local_xyz
+
+        # Patch embed
+        x = self.patch_embed(x)
+
+        # Encoder with skip connections
+        skips = []
+        xyzs = [xyz]
+        Ns = [N]
+
+        for i in range(4):
+            for block in self.enc_blocks[i]:
+                x = block(x, xyzs[-1])
+            skips.append(x)
+
+            if i < 3:
+                x, xyz_down, _ = self.enc_pools[i](x, xyzs[-1])
+                xyzs.append(xyz_down)
+                Ns.append(x.shape[2])
+
+        # Decoder
+        for i in range(3):
+            skip_idx = 2 - i  # skips[2], skips[1], skips[0]
+            x_up = self._upsample(x, Ns[skip_idx])
+            x = torch.cat([x_up, skips[skip_idx]], dim=1)
+            x = self.dec_projs[i](x)
+            x = self.dec_blocks[i](x, xyzs[skip_idx])
+
+        logits = self.seg_head(x)
         return logits

@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.model import PointNetSegmentation, DGCNNSegmentation, RandLANetSegmentation
+from src.model import PointNetSegmentation, DGCNNSegmentation, RandLANetSegmentation, PTv2LiteSegmentation
 from src.dataset import WallSegDataset
 from src.train import train
 
@@ -36,7 +36,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--name", type=str, default=None,
                         help="Custom run name (default: auto-increment run_XXX)")
-    parser.add_argument("--model", type=str, default="randla", choices=["dgcnn", "pointnet", "randla"],
+    parser.add_argument("--model", type=str, default="randla", choices=["dgcnn", "pointnet", "randla", "ptv2"],
                         help="Model architecture (default: randla)")
     parser.add_argument("--k", type=int, default=20,
                         help="KNN neighbors for DGCNN (default: 20)")
@@ -108,6 +108,11 @@ def main():
         ).to(device)
     elif args.model == "randla":
         model = RandLANetSegmentation(
+            input_dim=cfg["model"]["input_dim"],
+            num_classes=cfg["model"]["num_classes"],
+        ).to(device)
+    elif args.model == "ptv2":
+        model = PTv2LiteSegmentation(
             input_dim=cfg["model"]["input_dim"],
             num_classes=cfg["model"]["num_classes"],
         ).to(device)

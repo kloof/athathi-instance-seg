@@ -129,11 +129,16 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
 ) -> dict:
-    """Evaluate model on a dataset. Returns metrics dict."""
+    """Evaluate model on a dataset. Streams metrics to avoid OOM."""
     model.eval()
-    all_preds = []
-    all_labels = []
     total = len(loader)
+
+    # Accumulate confusion matrix incrementally (no giant arrays)
+    tp = 0  # true positive (wall predicted as wall)
+    fp = 0  # false positive (non-wall predicted as wall)
+    fn = 0  # false negative (wall predicted as non-wall)
+    tn = 0  # true negative
+    total_pts = 0
 
     for batch_idx, batch in enumerate(loader, 1):
         points, labels, room_mins, room_maxs = batch
@@ -141,19 +146,39 @@ def evaluate(
         room_mins = room_mins.to(device, dtype=torch.float32)
         room_maxs = room_maxs.to(device, dtype=torch.float32)
 
-        features = compute_features_batch_gpu(points, room_mins, room_maxs)
-        logits = model(features)
-        preds = logits.argmax(dim=1).cpu().numpy()
-        all_preds.append(preds.reshape(-1))
-        all_labels.append(labels.numpy().reshape(-1))
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            features = compute_features_batch_gpu(points, room_mins, room_maxs)
+            logits = model(features)
 
-        if batch_idx % 20 == 0 or batch_idx == total:
+        preds = logits.argmax(dim=1).cpu()
+        labels = labels.to(torch.int64)
+
+        wall_pred = preds == 1
+        wall_true = labels == 1
+        tp += (wall_pred & wall_true).sum().item()
+        fp += (wall_pred & ~wall_true).sum().item()
+        fn += (~wall_pred & wall_true).sum().item()
+        tn += (~wall_pred & ~wall_true).sum().item()
+        total_pts += labels.numel()
+
+        if batch_idx % 50 == 0 or batch_idx == total:
             print(f"  eval {batch_idx}/{total}", end="\r", flush=True)
 
-    all_preds = np.concatenate(all_preds)
-    all_labels = np.concatenate(all_labels)
+    # Compute metrics from confusion matrix
+    oa = (tp + tn) / max(total_pts, 1)
+    iou_wall = tp / max(tp + fp + fn, 1)
+    iou_nonwall = tn / max(tn + fp + fn, 1)
+    wall_precision = tp / max(tp + fp, 1)
+    wall_recall = tp / max(tp + fn, 1)
 
-    return compute_metrics(all_preds, all_labels)
+    return {
+        "overall_accuracy": float(oa),
+        "iou_nonwall": float(iou_nonwall),
+        "iou_wall": float(iou_wall),
+        "miou": float((iou_wall + iou_nonwall) / 2),
+        "wall_precision": float(wall_precision),
+        "wall_recall": float(wall_recall),
+    }
 
 
 def train(
