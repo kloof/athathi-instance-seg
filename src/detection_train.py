@@ -50,8 +50,8 @@ def _gpu_augment(points, offsets, device):
     points = points * scale
     offsets = offsets * scale
 
-    # Noise 5-20mm — points only (offsets are direction vectors, don't add noise)
-    noise_mag = torch.rand(B, N, 1, device=device) * 0.015 + 0.005
+    # Noise 10-30mm — points only (offsets are direction vectors, don't add noise)
+    noise_mag = torch.rand(B, N, 1, device=device) * 0.020 + 0.010
     noise_dir = torch.randn_like(points)
     noise_dir = noise_dir / (noise_dir.norm(dim=2, keepdim=True) + 1e-8)
     points = points + noise_dir * noise_mag

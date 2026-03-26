@@ -13,12 +13,12 @@ training:
   learning_rate: 0.0003
   weight_decay: 0.0001
   offset_weight: 1.0
-  max_points: 400000    # cap after densification to fit GPU memory
+  max_points: 400000
   eval_every: 5
   save_every: 5
   num_workers: 0
 
 augmentation:
   enabled: true
-  densify: false
-  densify_multiplier: 2
+  densify: true
+  densify_multiplier: 10

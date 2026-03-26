@@ -174,6 +174,7 @@ def main():
     parser.add_argument("--config", default="config_detection.yaml")
     parser.add_argument("--cluster_eps", type=float, default=0.3)
     parser.add_argument("--min_instance_pts", type=int, default=100)
+    parser.add_argument("--max_points", type=int, default=400000, help="Subsample input to this many points")
     args = parser.parse_args()
 
     import yaml
@@ -195,8 +196,20 @@ def main():
     print(f"Model loaded ({sum(p.numel() for p in model.parameters()):,} params)")
 
     # Load point cloud
-    pts, colors = load_ply(args.input)
-    print(f"Loaded {len(pts):,} points from {args.input}")
+    pts_full, colors_full = load_ply(args.input)
+    print(f"Loaded {len(pts_full):,} points from {args.input}")
+
+    # Subsample if too large for GPU
+    max_pts = args.max_points
+    if len(pts_full) > max_pts:
+        choice = np.random.choice(len(pts_full), max_pts, replace=False)
+        pts = pts_full[choice]
+        colors = colors_full[choice] if colors_full is not None else None
+        print(f"Subsampled to {max_pts:,} points for inference")
+    else:
+        pts = pts_full
+        colors = colors_full
+        choice = None
 
     # Center XY
     center_xy = pts[:, :2].mean(axis=0)
@@ -208,7 +221,7 @@ def main():
     room_mins = pts_t.min(dim=1).values
     room_maxs = pts_t.max(dim=1).values
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=device.type == "cuda"):
         features = compute_features_batch_gpu(pts_t, room_mins, room_maxs)
         sem_logits, offset_pred = model(features)
 
@@ -264,26 +277,40 @@ def main():
               f"size=({w:.2f}x{h:.2f}x{d:.2f}) | heading={math.degrees(heading):.0f}")
 
     # Save visualization
+    inp = Path(args.input)
     if args.output is None:
-        inp = Path(args.input)
         args.output = str(inp.parent / f"{inp.stem}_instances.ply")
 
-    # Instance-colored points + box wireframes
+    # 1. Instance-colored output: each instance a distinct color, stuff = gray
     rng = np.random.RandomState(42)
     palette = rng.randint(50, 255, (next_id, 3)).astype(np.uint8)
     palette[0] = [140, 140, 140]
-
-    out_pts = [pts]
-    out_colors = [palette[instance_labels]]
-
-    for cx, cy, cz, w, h, d, heading, cls_id, iid in boxes:
-        wire = box_wireframe(np.array([cx,cy,cz]), np.array([w,h,d]), heading)
-        out_pts.append(wire)
-        out_colors.append(np.tile(palette[iid], (len(wire), 1)))
-
-    write_ply(args.output, np.concatenate(out_pts).astype(np.float32),
-              np.concatenate(out_colors).astype(np.uint8))
+    write_ply(args.output, pts, palette[instance_labels])
     print(f"\nSaved: {args.output}")
+
+    # 2. Semantic-colored output: all 16 classes visible
+    SEM_COLORS = np.array([
+        [180, 180, 180],  # wall
+        [120, 80, 40],    # floor
+        [200, 200, 255],  # ceiling
+        [0, 200, 0],      # door
+        [0, 200, 255],    # window
+        [255, 128, 0],    # cabinet
+        [255, 0, 0],      # bed
+        [0, 0, 255],      # chair
+        [128, 0, 255],    # sofa
+        [255, 255, 0],    # table
+        [0, 128, 0],      # bookshelf
+        [128, 128, 0],    # desk
+        [200, 100, 50],   # dresser
+        [255, 200, 200],  # toilet
+        [0, 128, 128],    # sink
+        [100, 100, 100],  # other
+    ], dtype=np.uint8)
+    sem_output = str(inp.parent / f"{inp.stem}_semantic.ply")
+    sem_colors = SEM_COLORS[sem_pred.clip(0, 15)]
+    write_ply(sem_output, pts, sem_colors)
+    print(f"Saved: {sem_output}")
 
 
 if __name__ == "__main__":
