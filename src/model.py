@@ -297,17 +297,13 @@ class LocalFeatureAggregation(nn.Module):
         )  # (B, C, N*K)
         return gathered.reshape(B, C, N, K)
 
-    def _random_knn(self, x):
-        """KNN using torch_cluster (CUDA optimized). x: (B, C, N) -> idx: (B, N, K)"""
-        return knn(x, self.K)
-
-    def forward(self, x):
-        """x: (B, C, N) -> (B, out_ch, N)"""
+    def forward(self, x, xyz):
+        """x: (B, C, N), xyz: (B, 3, N) -> (B, out_ch, N)"""
         shortcut = self.shortcut(x)
         x = self.mlp_pre(x)
 
-        # Approximate KNN
-        idx = self._random_knn(x)
+        # KNN on xyz (3 dims) — much faster than feature-space KNN
+        idx = knn(xyz, self.K)
 
         # First attentive pooling
         neighbors = self._gather_neighbors(x, idx)  # (B, C, N, K)
@@ -381,17 +377,20 @@ class RandLANetSegmentation(nn.Module):
 
     def forward(self, x):
         B, _, N = x.shape
+        xyz = x[:, :3, :]  # first 3 channels are local_xyz
 
-        # Encoder
+        # Encoder — KNN on xyz coordinates (3 dims, fast)
         e0 = self.enc0(x)                              # (B, 32, N)
 
-        e1 = self.lfa1(e0)                             # (B, 64, N)
-        d1, _ = self._random_downsample(e1, 4)         # (B, 64, N/4)
+        e1 = self.lfa1(e0, xyz)                        # (B, 64, N)
+        d1, idx1 = self._random_downsample(e1, 4)      # (B, 64, N/4)
+        xyz1 = torch.gather(xyz, 2, idx1.unsqueeze(1).expand(-1, 3, -1))
 
-        e2 = self.lfa2(d1)                             # (B, 128, N/4)
-        d2, _ = self._random_downsample(e2, 4)         # (B, 128, N/16)
+        e2 = self.lfa2(d1, xyz1)                       # (B, 128, N/4)
+        d2, idx2 = self._random_downsample(e2, 4)      # (B, 128, N/16)
+        xyz2 = torch.gather(xyz1, 2, idx2.unsqueeze(1).expand(-1, 3, -1))
 
-        e3 = self.lfa3(d2)                             # (B, 256, N/16)
+        e3 = self.lfa3(d2, xyz2)                       # (B, 256, N/16)
 
         # Decoder
         u2 = self._upsample(e3, e2)                    # (B, 256+128, N/4)

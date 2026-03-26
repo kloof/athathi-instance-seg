@@ -110,6 +110,7 @@ def main():
         model = RandLANetSegmentation(
             input_dim=cfg["model"]["input_dim"],
             num_classes=cfg["model"]["num_classes"],
+            K=args.k,
         ).to(device)
     elif args.model == "ptv2":
         model = PTv2LiteSegmentation(
