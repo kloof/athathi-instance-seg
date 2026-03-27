@@ -8,6 +8,7 @@ Usage:
 """
 
 import numpy as np
+import os
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 import time
@@ -15,8 +16,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-RAW_PROCESSED = Path(r"C:\Users\klof\Desktop\New folder (4)\wall-seg\data\structured3d_panorama_processed")
-OUT_ROOT = Path(r"C:\Users\klof\Desktop\New folder (4)\wall-seg\data\processed_3m")
+RAW_PROCESSED = Path(os.environ.get(
+    "S3D_PROCESSED", r"C:\Users\klof\Desktop\New folder (4)\wall-seg\data\structured3d_panorama_processed"))
+OUT_ROOT = Path(os.environ.get(
+    "S3D_BLOCKS", r"C:\Users\klof\Desktop\New folder (4)\wall-seg\data\processed_3m"))
 BLOCK_SIZE = 3.0
 NUM_POINTS = 16384
 MIN_POINTS = 500

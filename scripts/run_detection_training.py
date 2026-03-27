@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.detection_model import LitePTInstanceSeg
 from src.detection_dataset import InstanceSegDataset, instance_collate
 from src.detection_train import train
+from src.ptv3_wrapper import PTv3InstanceSeg
 
 
 def next_run_dir(base: Path) -> Path:
@@ -78,13 +79,22 @@ def main():
         collate_fn=instance_collate,
     )
 
-    model = LitePTInstanceSeg(
-        input_dim=cfg["model"]["input_dim"],
-        num_classes=cfg["model"]["num_classes"],
-    ).to(device)
+    model_type = cfg["model"].get("type", "litept")
+    if model_type == "ptv3":
+        model = PTv3InstanceSeg(
+            input_dim=cfg["model"]["input_dim"],
+            num_classes=cfg["model"]["num_classes"],
+        ).to(device)
+        model_name = "PTv3InstanceSeg"
+    else:
+        model = LitePTInstanceSeg(
+            input_dim=cfg["model"]["input_dim"],
+            num_classes=cfg["model"]["num_classes"],
+        ).to(device)
+        model_name = "LitePTInstanceSeg"
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: LitePTInstanceSeg | Parameters: {total_params:,}")
+    print(f"Model: {model_name} | Parameters: {total_params:,}")
 
     train(model, train_loader, val_loader, cfg, device, run_dir,
           resume_checkpoint=args.resume, test_loader=test_loader)

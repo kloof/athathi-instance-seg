@@ -74,6 +74,15 @@ def download_chunk(url: str, start: int, end: int, chunk_path: str,
                 f.write(data)
                 with lock:
                     progress["downloaded"] += len(data)
+        # Verify chunk size matches expected range
+        actual = os.path.getsize(chunk_path)
+        expected = end - start + 1
+        if actual != expected:
+            # Corrupt chunk — delete so retry starts fresh
+            os.remove(chunk_path)
+            with lock:
+                progress["downloaded"] -= actual
+            return False
         return True
     except Exception as e:
         # Retry logic is handled by caller
@@ -136,8 +145,12 @@ def download_file(url: str, output_path: str, num_connections: int = 16,
 
     print(f"Size: {format_size(file_size)}")
 
-    # Create temp directory for chunks
+    # Create temp directory for chunks (clear stale parts from prior runs)
     temp_dir = output_path + ".parts"
+    if os.path.exists(temp_dir):
+        existing_chunks = [f for f in os.listdir(temp_dir) if f.startswith("chunk_")]
+        if len(existing_chunks) != num_connections:
+            shutil.rmtree(temp_dir)
     os.makedirs(temp_dir, exist_ok=True)
 
     # Split into chunks
@@ -164,15 +177,19 @@ def download_file(url: str, output_path: str, num_connections: int = 16,
             elapsed = time.time() - t0
             speed = done / max(elapsed, 0.01)
             pct = done / file_size * 100
-            remaining = (file_size - done) / max(speed, 1)
             bar_len = 30
             filled = int(bar_len * done / file_size)
             bar = "#" * filled + "-" * (bar_len - filled)
+            if speed > 1024 and done > 0:
+                remaining = (file_size - done) / speed
+                eta_str = f"ETA {remaining:.0f}s"
+            else:
+                eta_str = "ETA --"
             print(
                 f"\r  {bar} {pct:5.1f}% | "
                 f"{format_size(done)}/{format_size(file_size)} | "
                 f"{format_speed(speed)} | "
-                f"ETA {remaining:.0f}s   ",
+                f"{eta_str}   ",
                 end="", flush=True,
             )
             stop_progress.wait(0.5)

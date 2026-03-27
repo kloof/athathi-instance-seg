@@ -4,6 +4,7 @@ Loss = semantic CE + offset L1 (for thing points only).
 Pipeline: load raw → densify (keep all) → augment on GPU → features → model.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -61,7 +62,7 @@ def _gpu_augment(points, offsets, device):
 
 def train_one_epoch(model, loader, optimizer, criterion_sem, device, scaler=None,
                     densify=True, densify_multiplier=10, augment=True,
-                    offset_weight=1.0, max_points=200000):
+                    offset_weight=1.0, max_points=200000, grad_accumulation=1):
     """Train one epoch. Pipeline: densify (keep all) → augment → features → model."""
     model.train()
     total_loss = 0.0
@@ -124,25 +125,35 @@ def train_one_epoch(model, loader, optimizer, criterion_sem, device, scaler=None
         room_maxs = points.max(dim=1).values
         features = compute_features_batch_gpu(points, room_mins, room_maxs)
 
-        optimizer.zero_grad()
+        if num_batches % grad_accumulation == 0:
+            optimizer.zero_grad()
 
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            sem_logits, offset_pred = model(features)
+        try:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                sem_logits, offset_pred = model(features)
 
-            # Semantic loss
-            sem_loss = criterion_sem(sem_logits, sem_labels)
+                # Semantic loss
+                sem_loss = criterion_sem(sem_logits, sem_labels)
 
-            # Offset loss (only for thing points with instance > 0)
-            thing_mask = inst_labels > 0  # (B, N)
-            if thing_mask.any():
-                off_pred = offset_pred.permute(0, 2, 1)  # (B, N, 3)
-                off_loss = F.l1_loss(
-                    off_pred[thing_mask], offsets_gt[thing_mask],
-                )
-            else:
-                off_loss = torch.tensor(0.0, device=device)
+                # Offset loss (only for thing points with instance > 0)
+                thing_mask = inst_labels > 0  # (B, N)
+                if thing_mask.any():
+                    off_pred = offset_pred.permute(0, 2, 1)  # (B, N, 3)
+                    off_loss = F.l1_loss(
+                        off_pred[thing_mask], offsets_gt[thing_mask],
+                    )
+                else:
+                    off_loss = torch.tensor(0.0, device=device)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "OutOfMemory" in str(type(e).__name__) or "assert faild" in str(e) or "can't find suitable" in str(e):
+                print(f"  Skip batch {num_batches}: {type(e).__name__}", flush=True)
+                torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                num_batches += 1
+                continue
+            raise
 
-            loss = sem_loss + offset_weight * off_loss
+        loss = (sem_loss + offset_weight * off_loss) / grad_accumulation
 
         if torch.isnan(loss):
             print(f"  WARNING: NaN loss at batch {num_batches}, skipping")
@@ -151,16 +162,20 @@ def train_one_epoch(model, loader, optimizer, criterion_sem, device, scaler=None
 
         if use_amp:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            if (num_batches + 1) % grad_accumulation == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if (num_batches + 1) % grad_accumulation == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
-        total_loss += loss.item()
+        total_loss += loss.item() * grad_accumulation
         total_sem_loss += sem_loss.item()
         total_off_loss += off_loss.item()
         num_batches += 1
@@ -189,7 +204,9 @@ def train_one_epoch(model, loader, optimizer, criterion_sem, device, scaler=None
 def evaluate(model, loader, device, num_classes=15):
     """Evaluate semantic mIoU."""
     model.eval()
+    torch.cuda.empty_cache()
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+    eval_skipped = 0
 
     for batch in loader:
         points = batch["points"].to(device)
@@ -199,9 +216,16 @@ def evaluate(model, loader, device, num_classes=15):
         room_mins = points.min(dim=1).values
         room_maxs = points.max(dim=1).values
 
-        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            features = compute_features_batch_gpu(points, room_mins, room_maxs)
-            sem_logits, _ = model(features)
+        try:
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                features = compute_features_batch_gpu(points, room_mins, room_maxs)
+                sem_logits, _ = model(features)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            eval_skipped += 1
+            if eval_skipped <= 3:
+                print(f"  [eval] Error: {type(e).__name__}: {str(e)[:120]}", flush=True)
+            torch.cuda.empty_cache()
+            continue
 
         preds = sem_logits.argmax(dim=1).cpu().numpy().flatten()
         targets = sem_labels.numpy().flatten()
@@ -209,6 +233,9 @@ def evaluate(model, loader, device, num_classes=15):
         for p, t in zip(preds, targets):
             if t < num_classes:
                 confusion[t, p] += 1
+
+    if eval_skipped > 0:
+        print(f"  [eval] Skipped {eval_skipped}/{len(loader)} rooms", flush=True)
 
     # Per-class IoU
     ious = []
@@ -263,16 +290,33 @@ def train(model, train_loader, val_loader, cfg, device, checkpoint_dir,
     _check_flash_attention()
 
     num_classes = cfg["model"]["num_classes"]
-    criterion_sem = nn.CrossEntropyLoss()
+
+    # Class weights — inverse frequency, capped to avoid instability
+    class_weights = cfg["training"].get("class_weights", None)
+    if class_weights:
+        w = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        criterion_sem = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1)
+        print(f"Using class weights + label smoothing 0.1")
+    else:
+        criterion_sem = nn.CrossEntropyLoss(label_smoothing=0.05)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg["training"]["learning_rate"],
         weight_decay=cfg["training"]["weight_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg["training"]["epochs"],
-    )
+
+    # Cosine schedule with linear warmup
+    warmup_epochs = cfg["training"].get("warmup_epochs", 5)
+    total_epochs_cfg = cfg["training"]["epochs"]
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(total_epochs_cfg - warmup_epochs, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     aug_cfg = cfg.get("augmentation", {})
     do_densify = aug_cfg.get("densify", True)
@@ -284,6 +328,9 @@ def train(model, train_loader, val_loader, cfg, device, checkpoint_dir,
         print(f"GPU densification: {densify_mult}x (keep all)")
     if do_augment:
         print(f"GPU augmentation: rotation + flip + scale + noise")
+
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir=str(checkpoint_dir / "tb_logs"))
 
     best_miou = 0.0
     start_epoch = 1
@@ -308,6 +355,7 @@ def train(model, train_loader, val_loader, cfg, device, checkpoint_dir,
         "wall", "floor", "ceiling", "door", "window",
         "cabinet", "bed", "chair", "sofa", "table",
         "bookshelf", "desk", "dresser", "toilet", "sink",
+        "other",
     ]
 
     for epoch in range(start_epoch, total_epochs + 1):
@@ -317,6 +365,7 @@ def train(model, train_loader, val_loader, cfg, device, checkpoint_dir,
             densify=do_densify, densify_multiplier=densify_mult,
             augment=do_augment, offset_weight=offset_weight,
             max_points=cfg["training"].get("max_points", 200000),
+            grad_accumulation=cfg["training"].get("grad_accumulation", 1),
         )
         scheduler.step()
 
@@ -324,12 +373,20 @@ def train(model, train_loader, val_loader, cfg, device, checkpoint_dir,
         remaining = (total_epochs - epoch) * elapsed
         eta_min = remaining / 60
 
+        writer.add_scalar("train/loss", train_loss, epoch)
+        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
+
         eval_every = cfg["training"].get("eval_every", 5)
         if epoch % eval_every == 0 or epoch == start_epoch or epoch == 1:
             val_metrics = evaluate(model, val_loader, device, num_classes)
             miou = val_metrics["mIoU"]
             oa = val_metrics["overall_accuracy"]
             lr = optimizer.param_groups[0]["lr"]
+            writer.add_scalar("val/mIoU", miou, epoch)
+            writer.add_scalar("val/OA", oa, epoch)
+            for c, iou in val_metrics["per_class_iou"].items():
+                if iou > 0:
+                    writer.add_scalar(f"val/iou_{CLASS_NAMES[c]}", iou, epoch)
             print(
                 f"Epoch {epoch:3d}/{total_epochs} | "
                 f"loss={train_loss:.4f} | "
@@ -364,6 +421,7 @@ def train(model, train_loader, val_loader, cfg, device, checkpoint_dir,
             print(f"  -> Saved: {ckpt_path.name}")
 
     torch.save(model.state_dict(), checkpoint_dir / "final_model.pth")
+    writer.close()
     print(f"\nTraining complete. Best mIoU: {best_miou:.4f}")
 
     if test_loader:

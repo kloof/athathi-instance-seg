@@ -184,11 +184,26 @@ def augment_batch_gpu(
         )
 
     # 2. LiDAR-like noise — random 5-20mm per point
+    B, N, _ = points.shape  # refresh N after potential densify
     if noise_max > 0:
         noise_mag = torch.rand(B, N, 1, device=points.device) * (noise_max - noise_min) + noise_min
         noise_dir = torch.randn_like(points)
         noise_dir = noise_dir / (torch.norm(noise_dir, dim=2, keepdim=True) + 1e-8)
         points = points + noise_dir * noise_mag
+
+    # 3. Point dropout — randomly drop points to simulate occlusion
+    if dropout_keep < 1.0:
+        n_keep = max(int(N * dropout_keep), 1)
+        idx = torch.stack([torch.randperm(N, device=points.device)[:n_keep] for _ in range(B)])
+        points = torch.gather(points, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
+        labels = torch.gather(labels, 1, idx)
+        B, N, _ = points.shape  # update N
+
+    # 3.5. Random flip X and/or Y
+    flip_x = (torch.rand(B, device=points.device) > 0.5).float() * 2 - 1  # -1 or 1
+    flip_y = (torch.rand(B, device=points.device) > 0.5).float() * 2 - 1
+    points[:, :, 0] *= flip_x.unsqueeze(1)
+    points[:, :, 1] *= flip_y.unsqueeze(1)
 
     # 4. Random Z-axis rotation
     if rotation:

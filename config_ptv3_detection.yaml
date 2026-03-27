@@ -1,0 +1,27 @@
+data:
+  processed_root: "s3d_data/detection"
+
+model:
+  type: "ptv3"
+  input_dim: 10
+  num_classes: 16
+  backbone_K: 16
+
+training:
+  batch_size: 1
+  epochs: 100
+  learning_rate: 0.0003
+  weight_decay: 0.05
+  offset_weight: 2.5
+  max_points: 400000
+  eval_every: 5
+  save_every: 5
+  num_workers: 2
+  warmup_epochs: 5
+  grad_accumulation: 4
+  class_weights: [0.5, 1.0, 0.7, 2.0, 3.0, 2.2, 3.5, 8.0, 4.0, 6.0, 1.0, 8.0, 10.0, 10.0, 10.0, 0.5]
+
+augmentation:
+  enabled: true
+  densify: false
+  densify_multiplier: 1

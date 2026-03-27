@@ -1,5 +1,5 @@
 data:
-  processed_root: "data/detection_small"
+  processed_root: "s3d_data/detection"
   max_boxes: 64  # unused now, kept for compat
 
 model:
@@ -8,7 +8,7 @@ model:
   backbone_K: 16
 
 training:
-  batch_size: 1
+  batch_size: 2
   epochs: 100
   learning_rate: 0.0003
   weight_decay: 0.0001
@@ -20,5 +20,5 @@ training:
 
 augmentation:
   enabled: true
-  densify: true
+  densify: false
   densify_multiplier: 10
